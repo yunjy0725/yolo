@@ -27,7 +27,7 @@ st.divider()
 # STEP 2. YOLO 모델 불러오기
 # =====================================
 
-MODEL_PATH = r"C:\workspace\06_AI\YOLO_trian\best.pt"
+MODEL_PATH = r"C:\workspace\07_streamlit\best.pt"
 
 
 @st.cache_resource
