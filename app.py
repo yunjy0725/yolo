@@ -5,6 +5,7 @@ from PIL import Image
 import numpy as np
 import os
 import pandas as pd
+from io import BytesIO
 
 
 # =====================================
@@ -18,8 +19,7 @@ st.set_page_config(
 )
 
 st.title("🤖 YOLO Object Detection")
-st.write("YOLO 모델을 활용한 실시간 객체 탐지 웹페이지입니다.")
-
+st.write("YOLO 모델을 활용한 객체 탐지 웹페이지입니다.")
 st.divider()
 
 
@@ -27,8 +27,10 @@ st.divider()
 # STEP 2. YOLO 모델 불러오기
 # =====================================
 
-MODEL_PATH = r"C:\workspace\07_streamlit\best.pt"
-
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "best.pt"
+)
 
 @st.cache_resource
 def load_model():
@@ -39,7 +41,13 @@ if not os.path.exists(MODEL_PATH):
     st.error(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
     st.stop()
 
-model = load_model()
+try:
+    model = load_model()
+    st.success("YOLO 모델을 불러왔습니다!")
+
+except Exception as e:
+    st.error(f"YOLO 모델 로딩 실패: {e}")
+    st.stop()
 
 
 # =====================================
@@ -54,28 +62,23 @@ input_mode = st.radio(
     horizontal=True
 )
 
-image = None
-
 if input_mode == "사진 촬영":
-
     uploaded_file = st.camera_input("사진을 촬영하세요.")
 
 else:
-
     uploaded_file = st.file_uploader(
         "이미지를 업로드하세요.",
         type=["jpg", "jpeg", "png", "bmp"]
     )
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("RGB")
 
 
 # =====================================
 # STEP 4. 원본 이미지 출력
 # =====================================
 
-if image is not None:
+if uploaded_file is not None:
+
+    image = Image.open(uploaded_file).convert("RGB")
 
     col1, col2 = st.columns(2)
 
@@ -102,15 +105,25 @@ if image is not None:
 
             result = results[0]
 
-            # 객체 탐지 결과 이미지
+            # 탐지 결과 이미지
             result_image = result.plot()
 
-            # BGR -> RGB 변환
+            # BGR → RGB 변환
             result_image = result_image[:, :, ::-1]
 
-        # =====================================
-        # STEP 6. 탐지 결과 출력
-        # =====================================
+            # 결과 저장
+            st.session_state["result_image"] = result_image
+            st.session_state["result"] = result
+
+
+    # =====================================
+    # STEP 6. 탐지 결과 출력
+    # =====================================
+
+    if "result" in st.session_state:
+
+        result = st.session_state["result"]
+        result_image = st.session_state["result_image"]
 
         with col2:
             st.subheader("Object Detection 결과")
@@ -118,6 +131,7 @@ if image is not None:
                 result_image,
                 use_container_width=True
             )
+
 
         # =====================================
         # STEP 7. 탐지 결과 통계
@@ -139,6 +153,7 @@ if image is not None:
             "Model Classes",
             len(model.names)
         )
+
 
         # =====================================
         # STEP 8. 객체별 상세 정보
@@ -180,8 +195,6 @@ if image is not None:
 
             # 결과 이미지 다운로드
             result_pil = Image.fromarray(result_image)
-
-            from io import BytesIO
 
             image_buffer = BytesIO()
             result_pil.save(image_buffer, format="JPEG")
