@@ -1,6 +1,7 @@
-ultralytics
-opencv-python-headless
 streamlit
+streamlit-webrtc
+ultralytics
+opencv-contrib-python
 pillow
 numpy
 pandas

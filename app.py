@@ -1,215 +1,737 @@
 
 import streamlit as st
-from ultralytics import YOLO
-from PIL import Image
+import cv2
 import numpy as np
-import os
 import pandas as pd
-from io import BytesIO
+import os
+import csv
+import math
+import time
+import threading
+
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+from functools import lru_cache
+from ultralytics import YOLO
+from streamlit_webrtc import webrtc_streamer, RTCConfiguration
+from av import VideoFrame
 
 
-# =====================================
-# STEP 1. 웹페이지 기본 설정
-# =====================================
+# ==========================================
+# STEP 1. 기본 설정
+# ==========================================
 
 st.set_page_config(
-    page_title="YOLO Object Detection",
+    page_title="AI 얼굴 출석체크",
     page_icon="🤖",
     layout="wide"
 )
 
-st.title("🤖 YOLO Object Detection")
-st.write("YOLO 모델을 활용한 객체 탐지 웹페이지입니다.")
+st.title("🤖 AI 얼굴 출석체크 프로그램")
+st.write("얼굴을 등록하고 웹캠으로 자동 출석을 확인합니다.")
 st.divider()
 
 
-# =====================================
-# STEP 2. YOLO 모델 불러오기
-# =====================================
+# ==========================================
+# STEP 2. 파일 경로 설정
+# ==========================================
 
-MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "best.pt"
-)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODEL_PATH = os.path.join(BASE_DIR, "yolo26n.pt")
+FACE_DATA_DIR = os.path.join(BASE_DIR, "face_data")
+ATTENDANCE_FILE = os.path.join(BASE_DIR, "attendance.csv")
+
+os.makedirs(FACE_DATA_DIR, exist_ok=True)
+
+
+# ==========================================
+# STEP 3. YOLO 모델 불러오기
+# ==========================================
 
 @st.cache_resource
-def load_model():
-    return YOLO(MODEL_PATH)
+def load_yolo_model(model_path):
+    return YOLO(model_path)
 
 
 if not os.path.exists(MODEL_PATH):
-    st.error(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
+    st.error(f"YOLO 모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
     st.stop()
 
 try:
-    model = load_model()
-    st.success("YOLO 모델을 불러왔습니다!")
-
+    yolo_model = load_yolo_model(MODEL_PATH)
 except Exception as e:
     st.error(f"YOLO 모델 로딩 실패: {e}")
     st.stop()
 
 
-# =====================================
-# STEP 3. 이미지 입력
-# =====================================
+# ==========================================
+# STEP 4. 얼굴 인식용 함수
+# ==========================================
 
-st.subheader("📷 이미지 입력")
-
-input_mode = st.radio(
-    "입력 방법을 선택하세요.",
-    ["사진 촬영", "이미지 업로드"],
-    horizontal=True
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
-if input_mode == "사진 촬영":
-    uploaded_file = st.camera_input("사진을 촬영하세요.")
 
-else:
-    uploaded_file = st.file_uploader(
-        "이미지를 업로드하세요.",
-        type=["jpg", "jpeg", "png", "bmp"]
+def prepare_face(face):
+    """얼굴 이미지를 인식하기 좋은 크기와 형태로 변환"""
+
+    face = cv2.resize(face, (200, 200))
+    face = cv2.equalizeHist(face)
+
+    return face
+
+
+# ==========================================
+# STEP 5. 한글 화면 출력 함수
+# ==========================================
+
+@lru_cache(maxsize=4)
+def get_korean_font(size):
+    font_paths = [
+        "C:/Windows/Fonts/malgun.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"
+    ]
+
+    for path in font_paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+
+    return ImageFont.load_default()
+
+
+def draw_korean_text(frame, text, position, size=28, color=(0, 255, 0)):
+    """OpenCV 화면에 한글 출력"""
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(rgb)
+
+    draw = ImageDraw.Draw(pil_image)
+    font = get_korean_font(size)
+
+    draw.text(
+        position,
+        text,
+        font=font,
+        fill=(color[2], color[1], color[0])
     )
 
-
-# =====================================
-# STEP 4. 원본 이미지 출력
-# =====================================
-
-if uploaded_file is not None:
-
-    image = Image.open(uploaded_file).convert("RGB")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("원본 이미지")
-        st.image(image, use_container_width=True)
+    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 
-    # =====================================
-    # STEP 5. YOLO Object Detection
-    # =====================================
+# ==========================================
+# STEP 6. 실시간 출석체크 처리 클래스
+# ==========================================
 
-    if st.button("🔍 Object Detection 실행", type="primary"):
+class AttendanceProcessor:
 
-        with st.spinner("객체를 탐지하고 있습니다..."):
+    def __init__(self, yolo, recognizer=None, names=None):
 
-            image_array = np.array(image)
+        self.yolo = yolo
+        self.recognizer = recognizer
+        self.names = names or {}
 
-            results = model.predict(
-                source=image_array,
-                conf=0.25,
-                verbose=False
-            )
+        self.lock = threading.Lock()
 
-            result = results[0]
+        self.countdown_name = None
+        self.start_time = None
 
-            # 탐지 결과 이미지
-            result_image = result.plot(masks=False)
+        self.attended = set()
 
-            # BGR → RGB 변환
-            result_image = result_image[:, :, ::-1]
+        # 기존 출석 기록 불러오기
+        if os.path.exists(ATTENDANCE_FILE):
+            try:
+                df = pd.read_csv(
+                    ATTENDANCE_FILE,
+                    encoding="utf-8-sig"
+                )
 
-            # 결과 저장
-            st.session_state["result_image"] = result_image
-            st.session_state["result"] = result
+                today = datetime.now().strftime("%Y-%m-%d")
 
+                if "날짜" in df.columns and "이름" in df.columns:
+                    today_df = df[df["날짜"] == today]
 
-    # =====================================
-    # STEP 6. 탐지 결과 출력
-    # =====================================
+                    self.attended = set(
+                        today_df["이름"].astype(str).tolist()
+                    )
 
-    if "result" in st.session_state:
-
-        result = st.session_state["result"]
-        result_image = st.session_state["result_image"]
-
-        with col2:
-            st.subheader("Object Detection 결과")
-            st.image(
-                result_image,
-                use_container_width=True
-            )
+            except Exception:
+                pass
 
 
-        # =====================================
-        # STEP 7. 탐지 결과 통계
-        # =====================================
+    def update_recognizer(self, recognizer, names):
 
-        object_count = len(result.boxes)
+        with self.lock:
+            self.recognizer = recognizer
+            self.names = names
 
-        st.divider()
-        st.subheader("📊 Detection Summary")
+            self.countdown_name = None
+            self.start_time = None
 
-        metric1, metric2 = st.columns(2)
 
-        metric1.metric(
-            "Detected Objects",
-            object_count
+    def save_attendance(self, name):
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now().strftime("%H:%M:%S")
+
+        file_exists = os.path.exists(ATTENDANCE_FILE)
+
+        with open(
+            ATTENDANCE_FILE,
+            "a",
+            newline="",
+            encoding="utf-8-sig"
+        ) as file:
+
+            writer = csv.writer(file)
+
+            if not file_exists:
+                writer.writerow(["날짜", "이름", "출석시간"])
+
+            writer.writerow([today, name, now])
+
+        self.attended.add(name)
+
+
+    def process_frame(self, frame):
+
+        # YOLO로 사람 탐지
+        results = self.yolo.predict(
+            source=frame,
+            imgsz=320,
+            classes=[0],
+            conf=0.35,
+            verbose=False
         )
 
-        metric2.metric(
-            "Model Classes",
-            len(model.names)
+        result = results[0]
+
+        # YOLO 사람 탐지 박스 표시
+        if result.boxes is not None:
+            for box in result.boxes:
+
+                x1, y1, x2, y2 = map(
+                    int,
+                    box.xyxy[0].tolist()
+                )
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (255, 180, 0),
+                    2
+                )
+
+        # 얼굴 탐지
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.2,
+            minNeighbors=5,
+            minSize=(80, 80)
+        )
+
+        with self.lock:
+
+            if self.recognizer is None:
+                return draw_korean_text(
+                    frame,
+                    "먼저 얼굴을 등록하고 모델을 학습하세요.",
+                    (20, 30),
+                    24,
+                    (0, 0, 255)
+                )
+
+            if len(faces) == 0:
+
+                self.countdown_name = None
+                self.start_time = None
+
+                return draw_korean_text(
+                    frame,
+                    "얼굴을 카메라에 비춰주세요.",
+                    (20, 30),
+                    28,
+                    (0, 255, 255)
+                )
+
+            # 가장 큰 얼굴 하나 선택
+            x, y, w, h = max(
+                faces,
+                key=lambda face: face[2] * face[3]
+            )
+
+            face_image = gray[y:y+h, x:x+w]
+            face_image = prepare_face(face_image)
+
+            # 등록된 얼굴과 비교
+            label, confidence = self.recognizer.predict(face_image)
+
+            # LBPH는 숫자가 낮을수록 유사도가 높음
+            # 환경에 따라 50~90 사이에서 조정할 수 있음
+            threshold = 70
+
+            if confidence > threshold:
+
+                self.countdown_name = None
+                self.start_time = None
+
+                cv2.rectangle(
+                    frame,
+                    (x, y),
+                    (x+w, y+h),
+                    (0, 0, 255),
+                    3
+                )
+
+                frame = draw_korean_text(
+                    frame,
+                    "등록되지 않은 얼굴입니다.",
+                    (20, 30),
+                    26,
+                    (0, 0, 255)
+                )
+
+                return frame
+
+            name = self.names.get(label, "알 수 없음")
+
+            cv2.rectangle(
+                frame,
+                (x, y),
+                (x+w, y+h),
+                (0, 255, 0),
+                3
+            )
+
+            # 이미 오늘 출석한 사람인지 확인
+            if name in self.attended:
+
+                frame = draw_korean_text(
+                    frame,
+                    f"{name}님은 이미 출석했습니다.",
+                    (20, 30),
+                    26,
+                    (0, 255, 0)
+                )
+
+                return frame
+
+            # 새로운 사람이 인식되었거나 사람이 바뀐 경우
+            if self.countdown_name != name:
+
+                self.countdown_name = name
+                self.start_time = time.time()
+
+            elapsed = time.time() - self.start_time
+            remaining = max(0, math.ceil(5 - elapsed))
+
+            # 5초가 지나면 출석 완료
+            if elapsed >= 5:
+
+                self.save_attendance(name)
+
+                frame = draw_korean_text(
+                    frame,
+                    "출석체크가 완료되었습니다.",
+                    (20, 30),
+                    30,
+                    (0, 255, 0)
+                )
+
+                frame = draw_korean_text(
+                    frame,
+                    f"{name}님 출석 완료!",
+                    (20, 75),
+                    28,
+                    (0, 255, 0)
+                )
+
+            else:
+
+                frame = draw_korean_text(
+                    frame,
+                    f"{name}님 얼굴 인식 완료!",
+                    (20, 30),
+                    26,
+                    (0, 255, 0)
+                )
+
+                # 카운트다운 표시
+                cv2.putText(
+                    frame,
+                    str(remaining),
+                    (frame.shape[1] // 2 - 30, frame.shape[0] // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    3,
+                    (0, 255, 0),
+                    5
+                )
+
+                frame = draw_korean_text(
+                    frame,
+                    "잠시만 기다려 주세요.",
+                    (20, 75),
+                    24,
+                    (0, 255, 255)
+                )
+
+        return frame
+
+
+    def video_frame_callback(self, video_frame):
+
+        frame = video_frame.to_ndarray(format="bgr24")
+
+        result_frame = self.process_frame(frame)
+
+        return VideoFrame.from_ndarray(
+            result_frame,
+            format="bgr24"
         )
 
 
-        # =====================================
-        # STEP 8. 객체별 상세 정보
-        # =====================================
+# ==========================================
+# STEP 7. 출석체크 처리 객체 생성
+# ==========================================
 
-        st.subheader("🔎 Detection Details")
+if "processor" not in st.session_state:
 
-        if object_count > 0:
+    st.session_state.processor = AttendanceProcessor(
+        yolo_model
+    )
 
-            detection_data = []
+if "camera_key" not in st.session_state:
+    st.session_state.camera_key = 0
 
-            for index, box in enumerate(result.boxes, start=1):
 
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
+processor = st.session_state.processor
 
-                class_name = model.names[class_id]
 
-                # Bounding Box 좌표
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
+# ==========================================
+# STEP 8. 얼굴 등록 화면
+# ==========================================
 
-                detection_data.append({
-                    "No": index,
-                    "Class": class_name,
-                    "Confidence": round(confidence, 4),
-                    "X1": round(x1, 2),
-                    "Y1": round(y1, 2),
-                    "X2": round(x2, 2),
-                    "Y2": round(y2, 2)
-                })
+st.header("1️⃣ 얼굴 등록")
 
-            df = pd.DataFrame(detection_data)
+st.write("출석체크할 사람의 이름을 입력하고 얼굴 사진을 촬영하세요.")
 
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True
-            )
+person_name = st.text_input(
+    "이름 입력",
+    placeholder="예: 홍길동"
+)
 
-            # 결과 이미지 다운로드
-            result_pil = Image.fromarray(result_image)
+captured_image = st.camera_input(
+    "얼굴 사진 촬영",
+    key=f"register_camera_{st.session_state.camera_key}"
+)
 
-            image_buffer = BytesIO()
-            result_pil.save(image_buffer, format="JPEG")
+if captured_image is not None:
 
-            st.download_button(
-                label="📥 탐지 결과 이미지 다운로드",
-                data=image_buffer.getvalue(),
-                file_name="detection_result.jpg",
-                mime="image/jpeg"
-            )
+    if st.button("📸 촬영한 얼굴 등록하기"):
+
+        if not person_name.strip():
+
+            st.warning("이름을 먼저 입력해 주세요.")
 
         else:
 
-            st.warning("탐지된 객체가 없습니다.")
+            name = person_name.strip()
+
+            # 폴더명으로 사용하기 어려운 문자 제거
+            safe_name = "".join(
+                c for c in name
+                if c not in '\\/:*?"<>|'
+            ).strip()
+
+            if not safe_name:
+
+                st.warning("올바른 이름을 입력해 주세요.")
+
+            else:
+
+                image = Image.open(captured_image).convert("RGB")
+                image_array = np.array(image)
+
+                gray = cv2.cvtColor(
+                    image_array,
+                    cv2.COLOR_RGB2GRAY
+                )
+
+                faces = face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.2,
+                    minNeighbors=5,
+                    minSize=(80, 80)
+                )
+
+                if len(faces) == 0:
+
+                    st.error(
+                        "얼굴을 찾을 수 없습니다. "
+                        "얼굴이 잘 보이도록 다시 촬영해 주세요."
+                    )
+
+                else:
+
+                    x, y, w, h = max(
+                        faces,
+                        key=lambda face: face[2] * face[3]
+                    )
+
+                    face = gray[y:y+h, x:x+w]
+                    face = prepare_face(face)
+
+                    person_folder = os.path.join(
+                        FACE_DATA_DIR,
+                        safe_name
+                    )
+
+                    os.makedirs(
+                        person_folder,
+                        exist_ok=True
+                    )
+
+                    existing_files = [
+                        f for f in os.listdir(person_folder)
+                        if f.lower().endswith((".jpg", ".png"))
+                    ]
+
+                    image_number = len(existing_files) + 1
+
+                    save_path = os.path.join(
+                        person_folder,
+                        f"{image_number}.jpg"
+                    )
+
+                    cv2.imwrite(save_path, face)
+
+                    st.success(
+                        f"{name}님의 얼굴 사진을 등록했습니다!"
+                    )
+
+                    st.session_state.camera_key += 1
+                    st.rerun()
+
+
+# ==========================================
+# STEP 9. 등록된 얼굴 확인
+# ==========================================
+
+st.divider()
+st.subheader("📋 등록된 사람")
+
+registered_people = []
+
+if os.path.exists(FACE_DATA_DIR):
+
+    for name in os.listdir(FACE_DATA_DIR):
+
+        folder = os.path.join(FACE_DATA_DIR, name)
+
+        if os.path.isdir(folder):
+
+            photo_count = len([
+                f for f in os.listdir(folder)
+                if f.lower().endswith((".jpg", ".png"))
+            ])
+
+            registered_people.append({
+                "이름": name,
+                "등록 사진 수": photo_count
+            })
+
+if registered_people:
+
+    st.dataframe(
+        pd.DataFrame(registered_people),
+        use_container_width=True,
+        hide_index=True
+    )
 
 else:
 
-    st.info("사진을 촬영하거나 이미지를 업로드해 주세요.")
+    st.info("아직 등록된 얼굴이 없습니다.")
+
+
+# ==========================================
+# STEP 10. 얼굴 인식 모델 학습
+# ==========================================
+
+st.divider()
+st.header("2️⃣ 얼굴 인식 모델 학습")
+
+st.write(
+    "등록한 얼굴 사진을 학습합니다. "
+    "한 사람당 여러 장의 사진을 등록하면 인식에 도움이 됩니다."
+)
+
+if st.button("🧠 얼굴 인식 모델 학습하기"):
+
+    if not hasattr(cv2, "face"):
+
+        st.error(
+            "OpenCV 얼굴 인식 기능을 찾을 수 없습니다. "
+            "opencv-contrib-python을 설치해 주세요."
+        )
+
+    else:
+
+        training_images = []
+        training_labels = []
+        names = {}
+
+        label_number = 0
+
+        for name in sorted(os.listdir(FACE_DATA_DIR)):
+
+            person_folder = os.path.join(
+                FACE_DATA_DIR,
+                name
+            )
+
+            if not os.path.isdir(person_folder):
+                continue
+
+            person_images = []
+
+            for filename in os.listdir(person_folder):
+
+                if not filename.lower().endswith((".jpg", ".png")):
+                    continue
+
+                image_path = os.path.join(
+                    person_folder,
+                    filename
+                )
+
+                face = cv2.imread(
+                    image_path,
+                    cv2.IMREAD_GRAYSCALE
+                )
+
+                if face is not None:
+
+                    face = prepare_face(face)
+
+                    person_images.append(face)
+
+            if person_images:
+
+                names[label_number] = name
+
+                for face in person_images:
+
+                    training_images.append(face)
+                    training_labels.append(label_number)
+
+                label_number += 1
+
+        if len(training_images) == 0:
+
+            st.warning("학습할 얼굴 사진이 없습니다.")
+
+        else:
+
+            recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+            recognizer.train(
+                training_images,
+                np.array(training_labels, dtype=np.int32)
+            )
+
+            processor.update_recognizer(
+                recognizer,
+                names
+            )
+
+            st.success(
+                f"얼굴 인식 모델 학습 완료! "
+                f"등록 인원: {len(names)}명 / "
+                f"사진 수: {len(training_images)}장"
+            )
+
+
+# ==========================================
+# STEP 11. 실시간 출석체크
+# ==========================================
+
+st.divider()
+st.header("3️⃣ 실시간 출석체크")
+
+st.write(
+    "웹캠을 시작하면 등록된 얼굴을 인식합니다. "
+    "같은 얼굴이 5초 동안 계속 인식되면 출석 처리됩니다."
+)
+
+if processor.recognizer is None:
+
+    st.info(
+        "먼저 얼굴을 등록하고 "
+        "'얼굴 인식 모델 학습하기' 버튼을 눌러 주세요."
+    )
+
+else:
+
+    webrtc_streamer(
+        key="face-attendance",
+        video_frame_callback=processor.video_frame_callback,
+        media_stream_constraints={
+            "video": True,
+            "audio": False
+        },
+        async_processing=True,
+        rtc_configuration=RTCConfiguration({
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]}
+            ]
+        })
+    )
+
+
+# ==========================================
+# STEP 12. 출석 현황
+# ==========================================
+
+st.divider()
+st.header("4️⃣ 출석 현황")
+
+if st.button("🔄 출석 현황 새로고침"):
+
+    st.rerun()
+
+if os.path.exists(ATTENDANCE_FILE):
+
+    try:
+
+        attendance_df = pd.read_csv(
+            ATTENDANCE_FILE,
+            encoding="utf-8-sig"
+        )
+
+        st.dataframe(
+            attendance_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            label="📥 출석 기록 CSV 다운로드",
+            data=attendance_df.to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name="attendance.csv",
+            mime="text/csv"
+        )
+
+    except Exception as e:
+
+        st.error(f"출석 기록을 읽을 수 없습니다: {e}")
+
+else:
+
+    st.info("아직 출석 기록이 없습니다.")
