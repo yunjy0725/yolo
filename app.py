@@ -106,7 +106,7 @@ if uploaded_file is not None:
             result = results[0]
 
             # 탐지 결과 이미지
-            result_image = result.plot()
+            result_image = result.plot(masks=False)
 
             # BGR → RGB 변환
             result_image = result_image[:, :, ::-1]
