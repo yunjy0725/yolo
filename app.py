@@ -73,6 +73,10 @@ face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
+if face_cascade.empty():
+    st.error("얼굴 탐지 모델을 불러오지 못했습니다.")
+    st.stop()
+
 
 def prepare_face(face):
     """얼굴 이미지를 인식하기 좋은 크기와 형태로 변환"""
