@@ -121,9 +121,6 @@ def draw_korean_text(frame, text, position, size=28, color=(0, 255, 0)):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 
-# ==========================================
-# STEP 6. 실시간 출석체크 처리 클래스
-# ==========================================
 
 class AttendanceProcessor:
 
@@ -139,6 +136,10 @@ class AttendanceProcessor:
         self.start_time = None
 
         self.attended = set()
+
+        # 출석 완료 메시지 표시용
+        self.completed_name = None
+        self.completed_at = None
 
         # 기존 출석 기록 불러오기
         if os.path.exists(ATTENDANCE_FILE):
@@ -170,6 +171,9 @@ class AttendanceProcessor:
             self.countdown_name = None
             self.start_time = None
 
+            self.completed_name = None
+            self.completed_at = None
+
 
     def save_attendance(self, name):
 
@@ -195,6 +199,88 @@ class AttendanceProcessor:
         self.attended.add(name)
 
 
+    # 민트 네온 카운트다운 디자인
+    def draw_countdown(self, frame, remaining, progress):
+
+        height, width = frame.shape[:2]
+
+        center_x = width // 2
+        center_y = height // 2
+
+        # 반투명 원형 배경
+        overlay = frame.copy()
+
+        cv2.circle(
+            overlay,
+            (center_x, center_y),
+            85,
+            (35, 45, 40),
+            -1
+        )
+
+        cv2.addWeighted(
+            overlay,
+            0.65,
+            frame,
+            0.35,
+            0,
+            frame
+        )
+
+        # 원형 테두리
+        cv2.circle(
+            frame,
+            (center_x, center_y),
+            75,
+            (90, 120, 100),
+            5
+        )
+
+        # 진행 상태를 보여주는 민트색 원형 게이지
+        end_angle = int(360 * progress)
+
+        cv2.ellipse(
+            frame,
+            (center_x, center_y),
+            (75, 75),
+            -90,
+            0,
+            end_angle,
+            (180, 255, 190),
+            6
+        )
+
+        # 카운트다운 숫자
+        number = str(remaining)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 3
+        thickness = 6
+
+        text_size = cv2.getTextSize(
+            number,
+            font,
+            font_scale,
+            thickness
+        )[0]
+
+        text_x = center_x - text_size[0] // 2
+        text_y = center_y + text_size[1] // 2
+
+        cv2.putText(
+            frame,
+            number,
+            (text_x, text_y),
+            font,
+            font_scale,
+            (180, 255, 190),
+            thickness,
+            cv2.LINE_AA
+        )
+
+        return frame
+
+
     def process_frame(self, frame):
 
         # YOLO로 사람 탐지
@@ -210,6 +296,7 @@ class AttendanceProcessor:
 
         # YOLO 사람 탐지 박스 표시
         if result.boxes is not None:
+
             for box in result.boxes:
 
                 x1, y1, x2, y2 = map(
@@ -221,12 +308,15 @@ class AttendanceProcessor:
                     frame,
                     (x1, y1),
                     (x2, y2),
-                    (255, 180, 0),
+                    (180, 200, 120),
                     2
                 )
 
         # 얼굴 탐지
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY
+        )
 
         faces = face_cascade.detectMultiScale(
             gray,
@@ -238,6 +328,7 @@ class AttendanceProcessor:
         with self.lock:
 
             if self.recognizer is None:
+
                 return draw_korean_text(
                     frame,
                     "먼저 얼굴을 등록하고 모델을 학습하세요.",
@@ -256,7 +347,7 @@ class AttendanceProcessor:
                     "얼굴을 카메라에 비춰주세요.",
                     (20, 30),
                     28,
-                    (0, 255, 255)
+                    (180, 255, 190)
                 )
 
             # 가장 큰 얼굴 하나 선택
@@ -269,12 +360,13 @@ class AttendanceProcessor:
             face_image = prepare_face(face_image)
 
             # 등록된 얼굴과 비교
-            label, confidence = self.recognizer.predict(face_image)
+            label, confidence = self.recognizer.predict(
+                face_image
+            )
 
-            # LBPH는 숫자가 낮을수록 유사도가 높음
-            # 환경에 따라 50~90 사이에서 조정할 수 있음
             threshold = 70
 
+            # 등록되지 않은 얼굴
             if confidence > threshold:
 
                 self.countdown_name = None
@@ -300,13 +392,39 @@ class AttendanceProcessor:
 
             name = self.names.get(label, "알 수 없음")
 
+            # 민트 네온 얼굴 인식 박스
             cv2.rectangle(
                 frame,
                 (x, y),
                 (x+w, y+h),
-                (0, 255, 0),
+                (180, 255, 190),
                 3
             )
+
+            # 출석 완료 메시지를 3초 동안 유지
+            if (
+                name == self.completed_name
+                and self.completed_at is not None
+                and time.time() - self.completed_at < 3
+            ):
+
+                frame = draw_korean_text(
+                    frame,
+                    "출석체크가 완료되었습니다!",
+                    (20, 30),
+                    30,
+                    (180, 255, 190)
+                )
+
+                frame = draw_korean_text(
+                    frame,
+                    f"{name}님 출석 완료!",
+                    (20, 75),
+                    28,
+                    (180, 255, 190)
+                )
+
+                return frame
 
             # 이미 오늘 출석한 사람인지 확인
             if name in self.attended:
@@ -316,7 +434,7 @@ class AttendanceProcessor:
                     f"{name}님은 이미 출석했습니다.",
                     (20, 30),
                     26,
-                    (0, 255, 0)
+                    (180, 255, 190)
                 )
 
                 return frame
@@ -328,19 +446,26 @@ class AttendanceProcessor:
                 self.start_time = time.time()
 
             elapsed = time.time() - self.start_time
-            remaining = max(0, math.ceil(5 - elapsed))
+
+            remaining = max(
+                0,
+                math.ceil(5 - elapsed)
+            )
 
             # 5초가 지나면 출석 완료
             if elapsed >= 5:
 
                 self.save_attendance(name)
 
+                self.completed_name = name
+                self.completed_at = time.time()
+
                 frame = draw_korean_text(
                     frame,
-                    "출석체크가 완료되었습니다.",
+                    "출석체크가 완료되었습니다!",
                     (20, 30),
                     30,
-                    (0, 255, 0)
+                    (180, 255, 190)
                 )
 
                 frame = draw_korean_text(
@@ -348,7 +473,7 @@ class AttendanceProcessor:
                     f"{name}님 출석 완료!",
                     (20, 75),
                     28,
-                    (0, 255, 0)
+                    (180, 255, 190)
                 )
 
             else:
@@ -358,18 +483,16 @@ class AttendanceProcessor:
                     f"{name}님 얼굴 인식 완료!",
                     (20, 30),
                     26,
-                    (0, 255, 0)
+                    (180, 255, 190)
                 )
 
-                # 카운트다운 표시
-                cv2.putText(
+                # 민트 네온 카운트다운
+                progress = min(elapsed / 5, 1.0)
+
+                frame = self.draw_countdown(
                     frame,
-                    str(remaining),
-                    (frame.shape[1] // 2 - 30, frame.shape[0] // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    3,
-                    (0, 255, 0),
-                    5
+                    remaining,
+                    progress
                 )
 
                 frame = draw_korean_text(
@@ -377,7 +500,7 @@ class AttendanceProcessor:
                     "잠시만 기다려 주세요.",
                     (20, 75),
                     24,
-                    (0, 255, 255)
+                    (180, 255, 190)
                 )
 
         return frame
@@ -385,7 +508,9 @@ class AttendanceProcessor:
 
     def video_frame_callback(self, video_frame):
 
-        frame = video_frame.to_ndarray(format="bgr24")
+        frame = video_frame.to_ndarray(
+            format="bgr24"
+        )
 
         result_frame = self.process_frame(frame)
 
@@ -393,6 +518,7 @@ class AttendanceProcessor:
             result_frame,
             format="bgr24"
         )
+
 
 
 # ==========================================
