@@ -68,6 +68,11 @@ except Exception as e:
 # ==========================================
 # STEP 4. 얼굴 인식용 함수
 # ==========================================
+st.write("OpenCV 버전:", cv2.__version__)
+st.write("OpenCV 경로:", cv2.__file__)
+st.write("CascadeClassifier 존재 여부:", hasattr(cv2, "CascadeClassifier"))
+st.write("cv2.face 존재 여부:", hasattr(cv2, "face"))
+
 
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
