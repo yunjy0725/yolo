@@ -1,9 +1,36 @@
+import os
+import sys
+import subprocess
+
+# OpenCV 패키지 충돌 임시 해결
+if os.environ.get("OPENCV_FIXED") != "1":
+
+    # 일반 OpenCV 제거
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip",
+            "uninstall", "-y", "opencv-python"
+        ],
+        check=False
+    )
+
+    # 얼굴 인식 기능이 포함된 OpenCV 재설치
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip",
+            "install", "--no-deps", "--force-reinstall",
+            "opencv-contrib-python-headless==4.11.0.86"
+        ],
+        check=True
+    )
+
+    os.environ["OPENCV_FIXED"] = "1"
+
 
 import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
-import os
 import csv
 import math
 import time
@@ -15,7 +42,6 @@ from functools import lru_cache
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, RTCConfiguration
 from av import VideoFrame
-
 
 # ==========================================
 # STEP 1. 기본 설정
